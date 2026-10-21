@@ -1,204 +1,213 @@
+import os
 import cv2
 import numpy as np
-import mediapipe as mp
-from scipy.spatial import distance as dist
-import time
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+
 
 class DrowsinessDetector:
-    def __init__(self):
-        # ---------------- INITIALIZE MEDIAPIPE FACE MESH ----------------
-        # Used to detect facial landmarks (eyes, mouth, etc.)
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(refine_landmarks=True)
+    """
+    CNN ensemble drowsiness detector.
 
-        # ---------------- FACIAL LANDMARK INDICES ----------------
-        # These indices correspond to eye and mouth points in MediaPipe
-        self.LEFT_EYE = [33, 160, 158, 133, 153, 144]
-        self.RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-        self.MOUTH = [13, 14, 78, 308, 82, 312]
+    Models expected:
+      - vgg19_model.keras
+      - resnet50_model.keras
+      - efficientnetb2_model.keras
 
-        # ---------------- THRESHOLDS ----------------
-        # EAR threshold: below this value → eyes considered closed
-        self.EAR_THRESHOLD = 0.15
+    IMPORTANT:
+    The saved models must already be trained/fine-tuned for the same classes.
+    This implementation assumes binary outputs:
+      * 2-class softmax: [awake_probability, drowsy_probability]
+      * or 1-unit sigmoid: probability of the DROWSY class
 
-        # MAR threshold: above this value → mouth considered open (yawning)
-        self.MAR_THRESHOLD = 0.6
+    Preprocessing and image size MUST match the training pipeline.
+    By default, all models receive a 224x224 RGB image scaled to [0, 1].
+    Change this if your models were trained differently.
+    """
 
-        # ---------------- TIME-BASED SETTINGS ----------------
-        # Blink duration (<= 0.5 sec → normal blink)
-        self.BLINK_MAX_DURATION = 0.5
+    def __init__(
+        self,
+        vgg19_path="vgg19_model.keras",
+        resnet50_path="resnet50_model.keras",
+        efficientnetb2_path="efficientnetb2_model.keras",
+        input_size=(224, 224),
+        drowsy_threshold=0.50,
+        face_crop=True,
+    ):
+        self.input_size = input_size
+        self.drowsy_threshold = drowsy_threshold
+        self.face_crop = face_crop
 
-        # Drowsiness duration (> 0.5 sec → prolonged eye closure)
-        self.DROWSY_TIME = 0.5
+        model_paths = {
+            "VGG19": vgg19_path,
+            "ResNet50": resnet50_path,
+            "EfficientNetB2": efficientnetb2_path,
+        }
 
-        # ---------------- STATE VARIABLES ----------------
-        # Stores time when eyes started closing
-        self.eye_closed_start = None
+        missing = [path for path in model_paths.values() if not os.path.isfile(path)]
+        if missing:
+            raise FileNotFoundError(
+                "Missing trained ensemble model file(s): "
+                + ", ".join(missing)
+                + ". Put the trained .keras/.h5 files in this directory or pass their paths."
+            )
 
-        # Total number of blinks detected
-        self.blink_counter = 0
+        self.models = {
+            name: load_model(path)
+            for name, path in model_paths.items()
+        }
 
-        # Yawning detection counters
-        self.yawn_counter_frames = 0
-        self.total_yawns = 0
+        # Face detector used only to crop the face; no facial landmarks, EAR, or MAR.
+        cascade_path = (
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self.face_detector = cv2.CascadeClassifier(cascade_path)
 
-        # Track start time for fatigue calculation
-        self.start_time = time.time()
+        if self.face_detector.empty():
+            raise RuntimeError("Could not load OpenCV Haar face detector.")
 
-    # ---------------- EYE ASPECT RATIO (EAR) ----------------
-    # EAR measures eye openness using distances between eye landmarks
-    def eye_aspect_ratio(self, eye):
-        A = dist.euclidean(eye[1], eye[5])  # vertical distance
-        B = dist.euclidean(eye[2], eye[4])  # vertical distance
-        C = dist.euclidean(eye[0], eye[3])  # horizontal distance
+    def _get_face_crop(self, frame):
+        """Return the largest detected face crop, or the full frame if none is found."""
+        if not self.face_crop:
+            return frame
 
-        # Prevent division by zero
-        if C == 0:
-            return 0
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(60, 60),
+        )
 
-        # EAR formula
-        return (A + B) / (2.0 * C)
+        if len(faces) == 0:
+            return frame
 
-    # ---------------- MOUTH ASPECT RATIO (MAR) ----------------
-    # MAR measures how wide the mouth is open (used for yawning)
-    def mouth_aspect_ratio(self, mouth):
-        A = dist.euclidean(mouth[0], mouth[1])  # vertical
-        B = dist.euclidean(mouth[2], mouth[3])  # horizontal
+        x, y, w, h = max(faces, key=lambda box: box[2] * box[3])
 
-        if B == 0:
-            return 0
+        # Add a small margin around the face, clipped to the frame.
+        margin_x = int(w * 0.15)
+        margin_y = int(h * 0.15)
+        x1 = max(0, x - margin_x)
+        y1 = max(0, y - margin_y)
+        x2 = min(frame.shape[1], x + w + margin_x)
+        y2 = min(frame.shape[0], y + h + margin_y)
 
-        return A / B
+        return frame[y1:y2, x1:x2]
 
-    # ---------------- EXTRACT LANDMARK POINTS ----------------
-    # Converts normalized landmarks into pixel coordinates
-    def get_points(self, landmarks, indices, w, h):
-        return np.array([
-            (int(landmarks[i].x * w), int(landmarks[i].y * h))
-            for i in indices
-        ])
+    def _preprocess(self, image):
+        """Preprocess one BGR image for the saved CNN models."""
+        if image is None or image.size == 0:
+            raise ValueError("Cannot preprocess an empty image.")
 
-    # ---------------- FATIGUE SCORE CALCULATION ----------------
-    # Combines blink rate, yawns, and eye closure time
-    def calculate_fatigue(self, blink_rate, yawns, eye_closed_time):
-        score = 0
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, self.input_size, interpolation=cv2.INTER_AREA)
+        image = image.astype(np.float32) / 255.0
+        return np.expand_dims(image, axis=0)
 
-        # High blink rate indicates fatigue
-        if blink_rate > 20:
-            score += 30
+    @staticmethod
+    def _drowsy_probability(model, batch):
+        """
+        Convert a model's binary prediction to P(drowsy).
+        Assumes sigmoid output means drowsy, or softmax index 1 means drowsy.
+        """
+        prediction = np.asarray(model.predict(batch, verbose=0))
 
-        # Each yawn adds fatigue
-        score += min(yawns * 10, 30)
+        if prediction.ndim == 1:
+            prediction = prediction.reshape(1, -1)
 
-        # Long eye closure adds major fatigue
-        if eye_closed_time > 0.5:
-            score += 40
+        values = prediction[0].astype(float).ravel()
 
-        return min(score, 100)  # limit score to 100%
+        if len(values) == 1:
+            # One-unit sigmoid output: assumed to represent the drowsy class.
+            return float(np.clip(values[0], 0.0, 1.0))
 
-    # ---------------- MAIN DETECTION FUNCTION ----------------
+        if len(values) == 2:
+            # Two-class softmax output: assumed order [awake, drowsy].
+            return float(np.clip(values[1], 0.0, 1.0))
+
+        raise ValueError(
+            "Each model must output either one sigmoid value or two softmax values."
+        )
+
     def detect(self, frame):
-        # Get frame dimensions
-        h, w, _ = frame.shape
+        """
+        Returns:
+            processed_frame, is_drowsy, fatigue_score
 
-        # Convert frame to RGB (required for MediaPipe)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        fatigue_score is the ensemble's drowsiness probability expressed as a
+        percentage; it is a model confidence score, not a medically validated
+        measure of fatigue.
+        """
+        if frame is None or frame.size == 0:
+            raise ValueError("Input frame is empty.")
 
-        # Process frame with face mesh
-        results = self.face_mesh.process(rgb)
+        face_image = self._get_face_crop(frame)
 
-        # Default states
-        is_drowsy = False
-        fatigue_score = 0
+        try:
+            batch = self._preprocess(face_image)
 
-        # If face is detected
-        if results.multi_face_landmarks:
-            for face in results.multi_face_landmarks:
-                landmarks = face.landmark
+            # Predict with all three CNN models.
+            model_probabilities = {
+                name: self._drowsy_probability(model, batch)
+                for name, model in self.models.items()
+            }
 
-                # ---------------- EYE DETECTION ----------------
-                left_eye = self.get_points(landmarks, self.LEFT_EYE, w, h)
-                right_eye = self.get_points(landmarks, self.RIGHT_EYE, w, h)
+            # Soft-voting ensemble: equal-weight average of probabilities.
+            ensemble_probability = float(
+                np.mean(list(model_probabilities.values()))
+            )
 
-                # Calculate EAR
-                ear = (self.eye_aspect_ratio(left_eye) + 
-                       self.eye_aspect_ratio(right_eye)) / 2
+            is_drowsy = ensemble_probability >= self.drowsy_threshold
+            fatigue_score = int(round(ensemble_probability * 100))
 
-                # Draw eye outlines
-                cv2.polylines(frame, [left_eye], True, (0,255,0), 1)
-                cv2.polylines(frame, [right_eye], True, (0,255,0), 1)
+            # Display ensemble output and each model's score.
+            status = "DROWSY ALERT!" if is_drowsy else "AWAKE"
+            color = (0, 0, 255) if is_drowsy else (0, 200, 0)
 
-                current_time = time.time()
-                eye_closed_time = 0
+            cv2.putText(
+                frame,
+                f"{status}  Ensemble: {ensemble_probability:.2f}",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                color,
+                2,
+            )
 
-                # If eyes are closed
-                if ear < self.EAR_THRESHOLD:
-                    if self.eye_closed_start is None:
-                        self.eye_closed_start = current_time
-
-                    # Calculate how long eyes are closed
-                    eye_closed_time = current_time - self.eye_closed_start
-
-                    # If eyes closed too long → drowsy
-                    if eye_closed_time > self.DROWSY_TIME:
-                        is_drowsy = True
-                        cv2.putText(frame, "DROWSY ALERT!", (30, 50),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 3)
-
-                else:
-                    # Eyes reopened → check if it was a blink
-                    if self.eye_closed_start is not None:
-                        duration = current_time - self.eye_closed_start
-
-                        # If short closure → blink
-                        if duration <= self.BLINK_MAX_DURATION:
-                            self.blink_counter += 1
-
-                    # Reset eye closure timer
-                    self.eye_closed_start = None
-
-                # ---------------- YAWN DETECTION ----------------
-                mouth = self.get_points(landmarks, self.MOUTH, w, h)
-
-                # Calculate MAR
-                mar = self.mouth_aspect_ratio(mouth)
-
-                # Draw mouth outline
-                cv2.polylines(frame, [mouth], True, (255,0,0), 1)
-
-                # If mouth open
-                if mar > self.MAR_THRESHOLD:
-                    self.yawn_counter_frames += 1
-                else:
-                    # If mouth was open long enough → count yawn
-                    if self.yawn_counter_frames >= 15:
-                        self.total_yawns += 1
-                    self.yawn_counter_frames = 0
-
-                # ---------------- FATIGUE CALCULATION ----------------
-                elapsed_minutes = (current_time - self.start_time) / 60
-
-                # Blink rate per minute
-                blink_rate = self.blink_counter / max(elapsed_minutes, 1)
-
-                # Compute fatigue score
-                fatigue_score = self.calculate_fatigue(
-                    blink_rate,
-                    self.total_yawns,
-                    eye_closed_time
+            y = 70
+            for name, probability in model_probabilities.items():
+                cv2.putText(
+                    frame,
+                    f"{name}: {probability:.2f}",
+                    (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 0),
+                    2,
                 )
+                y += 28
 
-                # ---------------- DISPLAY METRICS ----------------
-                cv2.putText(frame, f"EAR: {ear:.2f}", (30, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+            cv2.putText(
+                frame,
+                f"Drowsiness score: {fatigue_score}%",
+                (20, y + 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 255),
+                2,
+            )
 
-                cv2.putText(frame, f"Fatigue: {fatigue_score}%", (30, 120),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+            return frame, is_drowsy, fatigue_score
 
-                cv2.putText(frame, f"Blinks: {self.blink_counter}", (30, 180),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-
-                cv2.putText(frame, f"Yawns: {self.total_yawns}", (30, 210),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,255), 2)
-
-        # Return processed frame + drowsiness state + fatigue score
-        return frame, is_drowsy, fatigue_score
+        except Exception as exc:
+            # Surface a visible error and fail safely; do not claim a valid prediction.
+            cv2.putText(
+                frame,
+                "MODEL ERROR - CHECK MODEL/PREPROCESSING",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 255),
+                2,
+            )
+            raise RuntimeError(f"Ensemble prediction failed: {exc}") from exc
